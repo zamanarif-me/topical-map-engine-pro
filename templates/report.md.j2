@@ -1,0 +1,144 @@
+# Topical Map: {{ output.input.seed_keyword }}
+
+**Generated:** {{ generated_at }}
+**Engine version:** {{ output.version }}
+
+## Central Entity
+
+- **Primary:** {{ output.topical_map.central_entity.primary }}
+- **Supporting:** {{ output.topical_map.central_entity.supporting }}
+- **Source Context:** *{{ output.topical_map.central_entity.source_context }}*
+
+### Key Entities
+{% for entity in output.topical_map.central_entity.key_entities -%}
+- {{ entity }}
+{% endfor %}
+
+### Reasoning
+{{ output.topical_map.central_entity.reasoning }}
+
+---
+
+## Intake Summary
+
+- **Business focus:** {{ output.input.intake.business_focus.value }}
+- **Target audience:** {{ output.input.intake.target_audience | join(", ") }}
+- **Revenue services:** {{ output.input.intake.revenue_services | join(", ") }}
+- **Geographic targeting:** {{ output.input.intake.geo.scope.value }} ({{ (output.input.intake.geo.countries + output.input.intake.geo.cities) | join(", ") }})
+- **Site stage:** {{ output.input.intake.site_stage.value }}
+- **Positioning:** {{ output.input.intake.positioning | join(", ") }}
+- **Focus areas:** {{ output.input.intake.focus_areas | join(", ") }}
+- **Content mix:** {{ output.input.intake.content_mix.value }}
+
+---
+
+## Pillar Pages (Tier 1)
+
+{{ output.topical_map.pillars | length }} pillars generated.
+
+| # | Title | Intent | Funnel | Priority | Signal |
+|---|-------|--------|--------|----------|--------|
+{% for p in output.topical_map.pillars -%}
+| {{ loop.index }} | {{ p.title }} | {{ p.intent.value }} | {{ p.funnel_stage.value }} | P{{ p.priority }} | {{ p.validation_signal or "—" }} |
+{% endfor %}
+
+{% for p in output.topical_map.pillars %}
+### {{ loop.index }}. {{ p.title }}
+
+- **Intent:** {{ p.intent.value }} | **Funnel:** {{ p.funnel_stage.value }} | **Priority:** {{ p.priority }}
+{% if p.validation_signal -%}
+- **Web validation:** {{ p.validation_signal }} — {{ p.validation_reasoning }}
+{% endif -%}
+- **Commercial value:** {{ p.commercial_value }}
+- **Related entities:** {{ p.related_entities | join(", ") }}
+
+**Representative queries:**
+{% for q in p.representative_queries -%}
+- `{{ q.text }}` ({{ q.intent.value }})
+{% endfor %}
+
+**Clusters ({{ p.clusters | length }}):**
+
+{% for c in p.clusters %}
+#### {{ p.priority }}.{{ loop.index }} {{ c.title }}
+
+- Intent: {{ c.intent.value }} | Funnel: {{ c.funnel_stage.value }}
+{% if c.validation_signal -%}
+- Web validation: {{ c.validation_signal }}
+{% endif -%}
+
+{% if c.represented_queries -%}
+Represented queries:
+{% for q in c.represented_queries -%}
+- `{{ q.text }}` ({{ q.intent.value }})
+{% endfor %}
+{% endif %}
+{% if c.supplementary_nodes -%}
+Supplementary nodes ({{ c.supplementary_nodes | length }}):
+{% for s in c.supplementary_nodes -%}
+- [{{ s.angle | upper if s.angle else "—" }}] {{ s.title }} ({{ s.intent.value }}, {{ s.funnel_stage.value }})
+{% endfor %}
+{% endif %}
+{% endfor %}
+
+---
+{% endfor %}
+
+{% if output.topical_map.geo_pages %}
+## Geographic Service Pages
+
+| Title | Parent pillar | Geography |
+|-------|---------------|-----------|
+{% for g in output.topical_map.geo_pages -%}
+| {{ g.title }} | {{ g.parent_pillar_id }} | {{ g.geography }} |
+{% endfor %}
+
+---
+{% endif %}
+
+## Internal Linking Plan
+
+### Homepage Links
+
+The homepage should link directly to:
+{% for pid in output.linking_plan.homepage_links -%}
+- `{{ pid }}` ({{ pillar_titles[pid] if pid in pillar_titles else pid }})
+{% endfor %}
+
+### Total Links
+
+{{ output.linking_plan.links | length }} internal links across the topical map.
+
+### Link Breakdown by Relationship
+
+{% for rel, count in link_counts.items() -%}
+- **{{ rel }}:** {{ count }} links
+{% endfor %}
+
+### Entity Bridges (Cross-Pillar Links)
+
+Entity bridges are the strategic links that build topical authority across pillars by reinforcing shared entities.
+
+| From | To | Anchor | Strength | Reasoning |
+|------|-----|--------|----------|-----------|
+{% for link in entity_bridges -%}
+| {{ link.from_page_id }} | {{ link.to_page_id }} | "{{ link.anchor_text }}" | {{ "%.2f"|format(link.relationship_strength) if link.relationship_strength else "—" }} | {{ link.reasoning }} |
+{% endfor %}
+
+### Sample Links by Pillar
+
+{% for p in output.topical_map.pillars %}
+#### Links involving {{ p.title }}
+
+{% set pillar_links = links_by_pillar.get(p.id, []) -%}
+{% if pillar_links -%}
+{% for link in pillar_links[:10] -%}
+- `{{ link.from_page_id }}` → `{{ link.to_page_id }}` ({{ link.relationship.value }})
+  Anchor: *"{{ link.anchor_text }}"*
+  Why: {{ link.reasoning }}
+{% endfor %}
+{% if pillar_links | length > 10 -%}
+*...and {{ pillar_links | length - 10 }} more*
+{% endif %}
+{% endif %}
+{% endfor %}

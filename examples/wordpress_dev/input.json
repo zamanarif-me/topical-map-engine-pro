@@ -1,0 +1,34 @@
+{
+  "seed_keyword": "WordPress website development and security service",
+  "language": "en-US",
+  "intake": {
+    "business_focus": "personal_freelancer_brand",
+    "target_audience": [
+      "local businesses",
+      "e-commerce stores",
+      "bloggers",
+      "startups"
+    ],
+    "revenue_services": [
+      "website builds",
+      "speed optimization"
+    ],
+    "geo": {
+      "scope": "country_specific",
+      "countries": ["USA", "Europe"],
+      "cities": []
+    },
+    "site_stage": "brand_new",
+    "positioning": [
+      "seo_focused",
+      "enterprise_grade",
+      "affordable"
+    ],
+    "focus_areas": [
+      "Elementor",
+      "Performance optimization",
+      "Firewall setup"
+    ],
+    "content_mix": "balanced_authority_site"
+  }
+}
