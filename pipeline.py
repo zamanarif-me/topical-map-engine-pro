@@ -23,6 +23,24 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
+
+def _safe_stdout_write(msg: str) -> None:
+    """
+    Write to the real terminal stdout, bypassing any monkey-patched
+    `print` or redirected `sys.stdout`. This is essential because the
+    pipeline runs in a background thread — if some other code has
+    patched `builtins.print` to call Streamlit UI methods, those calls
+    will fail with NoSessionContext when invoked from a non-main thread.
+
+    `sys.__stdout__` is the ORIGINAL stdout that Python captured at
+    interpreter start; it is never reassigned by user code.
+    """
+    try:
+        sys.__stdout__.write(msg)
+        sys.__stdout__.flush()
+    except Exception:
+        pass
+
 from models import (
     SeedInput, TopicalMap, EngineOutput,
     CentralEntity, Pillar, LinkingPlan,
@@ -41,7 +59,10 @@ from stages.cost_tracker import tracker
 
 
 def _log(msg: str):
-    print(f"[pipeline] {msg}", flush=True)
+    # Use sys.__stdout__ directly so we can never accidentally end up
+    # calling a monkey-patched `print` that touches Streamlit UI from
+    # the background worker thread (that path raises NoSessionContext).
+    _safe_stdout_write(f"[pipeline] {msg}\n")
 
 
 # ── Serialization helpers for SerpData (dataclass, not pydantic) ──────────────

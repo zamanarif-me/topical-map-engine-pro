@@ -62,6 +62,35 @@ def _worker_alive(run_id: str) -> bool:
         return bool(t and t.is_alive())
 
 
+def _safe_print(*args, sep: str = " ", end: str = "\n", file=None, flush: bool = False):
+    """
+    A drop-in `print` replacement that writes only to the original stdout
+    captured by Python at interpreter start (sys.__stdout__). Safe to call
+    from any thread because it never touches Streamlit UI.
+    """
+    import sys as _sys
+    target = file if file is not None else _sys.__stdout__
+    try:
+        target.write(sep.join(str(a) for a in args) + end)
+        if flush:
+            target.flush()
+    except Exception:
+        pass
+
+
+def _reset_builtin_print() -> None:
+    """
+    Forcibly restore a safe `builtins.print`. Older versions of this UI
+    monkey-patched `builtins.print` to call Streamlit UI helpers so that
+    pipeline log output appeared inside the page. That patch leaks across
+    code reloads on Streamlit Cloud (same Python process), and from a
+    background thread the Streamlit calls raise NoSessionContext. We
+    install a thread-safe replacement once per worker spawn.
+    """
+    import builtins
+    builtins.print = _safe_print
+
+
 def _spawn_worker(run_id: str, seed, settings: dict) -> None:
     """Start the pipeline in a background thread. Idempotent per run_id."""
     with _WORKER_LOCK:
@@ -69,7 +98,13 @@ def _spawn_worker(run_id: str, seed, settings: dict) -> None:
         if existing and existing.is_alive():
             return
 
+        # Clean up any stale print monkey-patch before launching the worker.
+        # Do this in both the parent and child threads to be safe.
+        _reset_builtin_print()
+
         def _target():
+            # Background thread — make absolutely sure print is harmless here.
+            _reset_builtin_print()
             try:
                 from pipeline import run_pipeline
                 run_pipeline(
