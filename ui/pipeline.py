@@ -1,146 +1,365 @@
-"""Pipeline page — runs the engine and shows live progress."""
+"""
+Pipeline page — runs the engine in a background thread, polls progress
+from disk, and resumes interrupted runs.
 
-import sys
-import io
+Architecture
+------------
+The pipeline is a long-running blocking call (~minutes). Streamlit's main
+script thread cannot block on it without freezing the UI, and a network
+blip will sever the WebSocket. To survive both:
+
+  1. The actual run executes in a `threading.Thread` (daemon) inside the
+     Streamlit server process. It writes progress + checkpoints to disk
+     under `runs/<run_id>/`.
+
+  2. The Streamlit UI polls `runs/<run_id>/progress.json` every 2 seconds
+     and re-renders. Polling is cheap and survives WS blips because the
+     URL preserves `run_id` (see ui/router.py).
+
+  3. If the worker thread dies (page reload, Streamlit Cloud session
+     reset) we detect on next entry that progress.status == "running"
+     but no thread is alive in this process — and we re-spawn it. The
+     refactored `pipeline.run_pipeline()` checks for per-stage
+     checkpoints and skips work that finished before the crash, so the
+     repeat is cheap.
+
+Resume policy
+-------------
+  * If a run is `completed`, load the EngineOutput and jump to results.
+  * If a run is `running_active` (heartbeat within 2 min): keep polling
+    or re-spawn the worker if missing.
+  * If a run is `running_stale` (>2 min since last heartbeat): ask the
+    user — Resume (which will re-spawn the worker and continue from the
+    last checkpoint) or Start Fresh.
+  * If a run is `failed`: show the error and offer Restart.
+"""
+
+from __future__ import annotations
+
 import os
+import threading
+import time
+import traceback
+from pathlib import Path
+
 import streamlit as st
 
+from ui import run_state
+from ui.router import set_page, clear_run
+
+
+# ── Background worker ─────────────────────────────────────────────────────────
+
+# Track currently-running threads in this Python process so we don't spawn
+# duplicates on every poll-rerun. Keyed by run_id.
+_WORKERS: dict[str, threading.Thread] = {}
+_WORKER_LOCK = threading.Lock()
+
+
+def _worker_alive(run_id: str) -> bool:
+    with _WORKER_LOCK:
+        t = _WORKERS.get(run_id)
+        return bool(t and t.is_alive())
+
+
+def _spawn_worker(run_id: str, seed, settings: dict) -> None:
+    """Start the pipeline in a background thread. Idempotent per run_id."""
+    with _WORKER_LOCK:
+        existing = _WORKERS.get(run_id)
+        if existing and existing.is_alive():
+            return
+
+        def _target():
+            try:
+                from pipeline import run_pipeline
+                run_pipeline(
+                    seed=seed,
+                    output_dir=run_state.run_dir(run_id),
+                    skip_serp=settings.get("skip_serp", False),
+                    skip_validation=settings.get("skip_validation", False),
+                    serp_geo=settings.get("serp_geo", "us"),
+                    serp_lang=settings.get("serp_lang", "en"),
+                    run_id=run_id,
+                )
+            except Exception as e:
+                run_state.mark_run_failed(run_id, f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+        thread = threading.Thread(target=_target, daemon=True, name=f"pipeline-{run_id}")
+        thread.start()
+        _WORKERS[run_id] = thread
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+STAGE_LABELS = {
+    "stage2":   "Central entity",
+    "stage3":   "Pillars & clusters",
+    "stage3_5": "SERP intelligence",
+    "stage4":   "Topic validation",
+    "stage5":   "Query generation",
+    "stage6":   "Supplementary nodes",
+    "stage7":   "Internal linking",
+    "stage8":   "Render outputs",
+}
+
+
+def _check_api_keys() -> list[str]:
+    missing = []
+    for key in ["ANTHROPIC_API_KEY", "SERPER_API_KEY"]:
+        if not os.environ.get(key):
+            missing.append(key)
+    return missing
+
+
+def _load_completed_output(run_id: str):
+    """Load the final EngineOutput for a completed run. Returns (output, output_dir)."""
+    try:
+        from ui.session_manager import load_session, get_session_output_dir
+        output, _meta = load_session(run_id)
+        if output:
+            return output, get_session_output_dir(run_id)
+    except Exception:
+        pass
+    # Fallback: try loading directly from the run dir
+    try:
+        import json as _json
+        from models import EngineOutput
+        path = run_state.run_dir(run_id) / "topical_map.json"
+        if path.exists():
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            return EngineOutput.model_validate(data), str(run_state.run_dir(run_id))
+    except Exception:
+        pass
+    return None, None
+
+
+def _render_progress_panel(progress: dict, run_id: str) -> None:
+    """Visual progress: completed stages, current stage, last message."""
+    completed = set(progress.get("completed_stages", []))
+    total     = len(STAGE_LABELS)
+    done      = len(completed)
+    pct       = int(100 * done / total) if total else 0
+
+    st.markdown(f"""
+<div style="background:#13131a; border:1px solid #1e1e2e; border-radius:12px;
+            padding:1.2rem; margin-bottom:1rem;">
+    <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:0.6rem;">
+        <div style="font-size:1rem; font-weight:500; color:#e8e8f0;">
+            Pipeline progress
+        </div>
+        <div style="font-family:DM Mono,monospace; color:#6c63ff; font-size:0.95rem;">
+            {done} / {total} stages
+        </div>
+    </div>
+    <div style="background:#1e1e2e; border-radius:6px; height:8px; margin-bottom:0.8rem;">
+        <div style="background:#6c63ff; height:8px; border-radius:6px;
+                    width:{pct}%; transition:width 0.5s;"></div>
+    </div>
+    <div style="font-size:0.78rem; color:#6b6b8a; font-family:DM Mono,monospace;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+        {progress.get("message", "")[:120]}
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+    # Stage checklist
+    cols = st.columns(4)
+    for i, (sid, label) in enumerate(STAGE_LABELS.items()):
+        with cols[i % 4]:
+            if sid in completed:
+                icon, color = "✅", "#43e97b"
+            elif sid == progress.get("last_stage"):
+                icon, color = "⏳", "#6c63ff"
+            else:
+                icon, color = "○", "#6b6b8a"
+            st.markdown(
+                f"<div style='font-size:0.85rem; color:{color}; margin-bottom:0.3rem;'>"
+                f"{icon} {label}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+# ── Main render ───────────────────────────────────────────────────────────────
 
 def render_pipeline():
     st.markdown("## 🔄 Generating Topical Map")
 
-    seed = st.session_state.get("seed_input")
-    settings = st.session_state.get("pipeline_settings", {})
-
-    if not seed:
-        st.error("No seed input found. Please start from the intake form.")
-        if st.button("← Back to form"):
-            st.session_state.page = "intake"
-            st.rerun()
-        return
-
-    st.markdown(f"**Seed:** `{seed.seed_keyword}`")
-    st.markdown(f"**Business:** {seed.intake.business_focus.value} | "
-                f"**Geo:** {seed.intake.geo.scope.value} | "
-                f"**SERP:** {'Enabled' if not settings.get('skip_serp') else 'Skipped'}")
-
-    st.markdown("<hr class='divider'>", unsafe_allow_html=True)
-
-    # Check API keys
-    missing_keys = []
-    for key in ["ANTHROPIC_API_KEY", "SERPER_API_KEY"]:
-        if not os.environ.get(key):
-            missing_keys.append(key)
-
+    # API key check
+    missing_keys = _check_api_keys()
     if missing_keys:
         st.error(f"Missing API keys: {', '.join(missing_keys)}")
-        st.info("Set them in your environment or in a `.env` file before running.")
-
-        with st.expander("How to set API keys"):
-            st.code("""
-# In your terminal before running streamlit:
-export ANTHROPIC_API_KEY=sk-ant-...
-export SERPER_API_KEY=...
-export GEMINI_API_KEY=...
-
-# Or create a .env file in the project root:
-ANTHROPIC_API_KEY=sk-ant-...
-SERPER_API_KEY=...
-GEMINI_API_KEY=...
-            """)
-        if st.button("← Back to form"):
-            st.session_state.page = "intake"
+        st.info("Set them in your environment or a `.env` file before running.")
+        if st.button("← Back to home"):
+            set_page("home")
             st.rerun()
         return
 
-    # Progress UI
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    log_container = st.empty()
-    logs = []
+    # Load dotenv if present
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
-    def update_log(msg: str, progress: float = None):
-        logs.append(msg)
-        log_html = "<div class='log-box'>" + "<br>".join(
-            f"<span style='color:{'#43e97b' if '[pipeline]' in l else '#6b6b8a'}'>{l}</span>"
-            for l in logs[-20:]
-        ) + "</div>"
-        log_container.markdown(log_html, unsafe_allow_html=True)
-        if progress is not None:
-            progress_bar.progress(progress)
-        status_text.markdown(f"*{msg}*")
+    run_id = st.session_state.get("active_run_id")
 
-    # Run pipeline
-    if not st.session_state.get("output"):
-        update_log("[pipeline] Starting...", 0.05)
-
-        # Monkey-patch print to capture pipeline logs
-        original_print = print
-        captured = []
-
-        def capture_print(*args, **kwargs):
-            msg = " ".join(str(a) for a in args)
-            captured.append(msg)
-            update_log(msg)
-            original_print(*args, **kwargs)
-
-        import builtins
-        builtins.print = capture_print
-
-        try:
-            # Load dotenv if available
-            try:
-                from dotenv import load_dotenv
-                load_dotenv()
-            except ImportError:
-                pass
-
-            from pipeline import run_pipeline
-            import tempfile, pathlib
-
-            output_dir = pathlib.Path("streamlit_output") / seed.seed_keyword[:30].replace(" ", "_")
-
-            update_log("[pipeline] Stage 2: Extracting central entity...", 0.15)
-            output = run_pipeline(
-                seed=seed,
-                output_dir=output_dir,
-                skip_serp=settings.get("skip_serp", False),
-                skip_validation=False,
-                serp_geo=settings.get("serp_geo", "us"),
-                serp_lang="en",
-            )
-            st.session_state.output = output
-            # Use session directory if auto-saved
-            session_id = getattr(output, "_session_id", None)
-            if session_id:
-                from ui.session_manager import get_session_output_dir
-                st.session_state.output_dir = get_session_output_dir(session_id)
-            else:
-                st.session_state.output_dir = str(output_dir)
-            progress_bar.progress(1.0)
-            status_text.markdown("✅ **Pipeline complete!**")
-
-        except Exception as e:
-            st.error(f"Pipeline failed: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+    # ── No active run: must come from intake with seed_input in session ──────
+    if not run_id:
+        seed = st.session_state.get("seed_input")
+        settings = st.session_state.get("pipeline_settings", {})
+        if not seed:
+            st.error("No seed input found. Please start from the intake form.")
+            if st.button("← Back to form"):
+                set_page("intake")
+                st.rerun()
             return
-        finally:
-            builtins.print = original_print
 
-    else:
-        progress_bar.progress(1.0)
-        status_text.markdown("✅ **Results already available.**")
-        update_log("[pipeline] Using cached output from this session.", 1.0)
+        # Mint a fresh run_id, persist seed+settings, kick off worker
+        run_id = run_state.new_run_id(seed.seed_keyword)
+        run_state.save_seed(run_id, seed)
+        run_state.save_settings(run_id, settings)
+        run_state.init_progress(run_id)
+        st.session_state.active_run_id = run_id
+        st.query_params["run"] = run_id
+        _spawn_worker(run_id, seed, settings)
+        st.rerun()
+        return
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("📊  View Results", use_container_width=True):
-            st.session_state.page = "results"
-            st.rerun()
-    with col2:
-        if st.button("← Run Again", use_container_width=True):
-            st.session_state.output = None
-            st.session_state.page = "intake"
-            st.rerun()
+    # ── Active run exists: figure out its state ──────────────────────────────
+    status = run_state.run_status(run_id)
+
+    # Show header
+    progress = run_state.read_progress(run_id) or {}
+    seed_obj = run_state.load_seed(run_id)
+    if seed_obj:
+        st.markdown(f"**Seed:** `{seed_obj.seed_keyword}`")
+    st.markdown(f"**Run ID:** `{run_id}` &nbsp;•&nbsp; **Status:** `{status}`",
+                unsafe_allow_html=True)
+    st.markdown("<hr class='divider'>", unsafe_allow_html=True)
+
+    # ── State: missing ───────────────────────────────────────────────────────
+    if status == "missing":
+        st.error(f"Run `{run_id}` not found on disk. It may have been deleted.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("← Start a new run"):
+                clear_run()
+                set_page("intake")
+                st.rerun()
+        with col2:
+            if st.button("Home"):
+                clear_run()
+                set_page("home")
+                st.rerun()
+        return
+
+    # ── State: completed ─────────────────────────────────────────────────────
+    if status == "completed":
+        output, output_dir = _load_completed_output(run_id)
+        if output:
+            st.session_state.output = output
+            st.session_state.output_dir = output_dir
+            st.success("✅ Pipeline complete!")
+            _render_progress_panel(progress, run_id)
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📊  View Results", use_container_width=True, type="primary"):
+                    set_page("results", run_id=run_id)
+                    st.rerun()
+            with col2:
+                if st.button("← Run Again (new map)", use_container_width=True):
+                    clear_run()
+                    st.session_state.pop("output", None)
+                    set_page("intake")
+                    st.rerun()
+        else:
+            st.warning("Run marked complete but output files are missing. Try resuming.")
+            if st.button("🔄 Re-run from last checkpoint"):
+                seed = run_state.load_seed(run_id)
+                settings = run_state.load_settings(run_id)
+                if seed:
+                    _spawn_worker(run_id, seed, settings)
+                st.rerun()
+        return
+
+    # ── State: failed ────────────────────────────────────────────────────────
+    if status == "failed":
+        st.error("Pipeline failed.")
+        err = progress.get("error", "")
+        if err:
+            with st.expander("Error details", expanded=True):
+                st.code(err)
+        _render_progress_panel(progress, run_id)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Retry from last checkpoint", use_container_width=True):
+                seed = run_state.load_seed(run_id)
+                settings = run_state.load_settings(run_id)
+                if seed:
+                    # Clear failed status — set back to running before spawning
+                    run_state.heartbeat(run_id, "Retrying from last checkpoint...")
+                    progress["status"] = "running"
+                    progress["error"] = None
+                    run_state._write_progress(run_id, progress)
+                    _spawn_worker(run_id, seed, settings)
+                st.rerun()
+        with col2:
+            if st.button("← Start a fresh run", use_container_width=True):
+                clear_run()
+                set_page("intake")
+                st.rerun()
+        return
+
+    # ── State: running_stale (>2 min since last heartbeat) ───────────────────
+    if status == "running_stale":
+        age = int(progress.get("last_updated_at") and run_state._seconds_since(progress["last_updated_at"]) or 0)
+        st.warning(
+            f"⚠️ This run hasn't updated in {age} seconds. The previous worker "
+            f"likely died (network drop or page reload). You can resume from "
+            f"the last completed stage or start fresh."
+        )
+        _render_progress_panel(progress, run_id)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶️  Resume from last checkpoint", use_container_width=True, type="primary"):
+                seed = run_state.load_seed(run_id)
+                settings = run_state.load_settings(run_id)
+                if seed:
+                    run_state.heartbeat(run_id, "Resuming...")
+                    _spawn_worker(run_id, seed, settings)
+                st.rerun()
+        with col2:
+            if st.button("🗑️  Discard & start fresh", use_container_width=True):
+                run_state.delete_run(run_id)
+                clear_run()
+                set_page("intake")
+                st.rerun()
+        return
+
+    # ── State: running_active ────────────────────────────────────────────────
+    # Heartbeat within 2 min. If our process lost the worker thread, re-spawn.
+    if not _worker_alive(run_id):
+        seed = run_state.load_seed(run_id)
+        settings = run_state.load_settings(run_id)
+        if seed:
+            _spawn_worker(run_id, seed, settings)
+
+    _render_progress_panel(progress, run_id)
+
+    # Live log (last completed stage messages)
+    completed = progress.get("completed_stages", [])
+    if completed:
+        log_html = "<div class='log-box'>" + "<br>".join(
+            f"<span style='color:#43e97b'>✓ {STAGE_LABELS.get(s, s)}</span>"
+            for s in completed
+        ) + "</div>"
+        st.markdown(log_html, unsafe_allow_html=True)
+
+    # Cancel button
+    if st.button("⏹  Stop run"):
+        run_state.mark_run_failed(run_id, "Cancelled by user")
+        st.rerun()
+
+    # Poll: rerun after 2s to refresh progress
+    time.sleep(2)
+    st.rerun()

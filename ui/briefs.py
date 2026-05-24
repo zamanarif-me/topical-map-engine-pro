@@ -10,6 +10,8 @@ import threading
 import streamlit as st
 from pathlib import Path
 
+from ui.router import set_page
+
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
@@ -81,7 +83,7 @@ def render_briefs():
     if not output:
         st.warning("No topical map found. Generate one first.")
         if st.button("← Back to home"):
-            st.session_state.page = "home"
+            set_page("home")
             st.rerun()
         return
 
@@ -90,7 +92,7 @@ def render_briefs():
     col_nav, col_title = st.columns([1, 5])
     with col_nav:
         if st.button("← Results"):
-            st.session_state.page = "results"
+            set_page("results")
             st.rerun()
     with col_title:
         st.markdown("## 📝 Content Brief Generator")

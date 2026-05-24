@@ -4,6 +4,8 @@ import json
 import streamlit as st
 from pathlib import Path
 
+from ui.router import set_page
+
 
 def render_results():
     output = st.session_state.get("output")
@@ -12,7 +14,7 @@ def render_results():
     if not output:
         st.warning("No results yet. Generate a topical map first.")
         if st.button("← Back to home"):
-            st.session_state.page = "home"
+            set_page("home")
             st.rerun()
         return
 
@@ -23,7 +25,7 @@ def render_results():
     col_nav, col_title = st.columns([1, 5])
     with col_nav:
         if st.button("← Home"):
-            st.session_state.page = "home"
+            set_page("home")
             st.rerun()
     with col_title:
         st.markdown(f"## {tm.central_entity.primary}")
@@ -126,8 +128,7 @@ def _render_pillars(tm):
             # Brief generator button
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button(f"📝 Generate Briefs for this Pillar", key=f"brief_{p.id}"):
-                st.session_state.brief_target_pillar_id = p.id
-                st.session_state.page = "briefs"
+                set_page("briefs", brief_pillar=p.id)
                 st.rerun()
 
 

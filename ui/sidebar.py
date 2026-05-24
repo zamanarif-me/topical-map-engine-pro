@@ -8,6 +8,8 @@ Rendered on every page via app.py.
 import streamlit as st
 from pathlib import Path
 
+from ui.router import set_page, clear_run
+
 
 def render_sidebar():
     """Render the session history sidebar."""
@@ -66,7 +68,9 @@ def render_sidebar():
                         if output:
                             st.session_state.output     = output
                             st.session_state.output_dir = get_session_output_dir(session_id)
-                            st.session_state.page       = "results"
+                            # Loading a saved session — drop any active in-progress run
+                            clear_run()
+                            set_page("results")
                             st.success(f"Loaded: {seed[:30]}")
                             st.rerun()
                         else:
@@ -108,7 +112,8 @@ def render_sidebar():
                 seed = output.input.seed_keyword
                 st.session_state.output     = output
                 st.session_state.output_dir = "uploaded_session"
-                st.session_state.page       = "results"
+                clear_run()
+                set_page("results")
                 st.success(f"Loaded: {seed[:30]}")
                 st.rerun()
             except Exception as e:

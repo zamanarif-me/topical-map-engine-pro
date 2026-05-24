@@ -2,6 +2,8 @@
 
 import streamlit as st
 
+from ui.router import set_page
+
 
 def render_home():
     col1, col2 = st.columns([3, 2])
@@ -24,13 +26,19 @@ def render_home():
         col_a, col_b = st.columns([1, 2])
         with col_a:
             if st.button("🗺️  New Project", use_container_width=True):
-                st.session_state.page = "intake"
+                # Fresh intake — drop any prior in-progress run id
+                from ui.router import clear_run
+                clear_run()
+                st.session_state.pop("seed_input", None)
+                st.session_state.pop("intake_step", None)
+                st.session_state.pop("intake_data", None)
+                set_page("intake")
                 st.rerun()
 
         if st.session_state.get("output"):
             with col_b:
                 if st.button("📊  View Last Results", use_container_width=True):
-                    st.session_state.page = "results"
+                    set_page("results")
                     st.rerun()
 
     with col2:

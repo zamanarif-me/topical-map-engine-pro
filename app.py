@@ -198,9 +198,11 @@ from ui.pipeline import render_pipeline
 from ui.results import render_results
 from ui.briefs import render_briefs
 from ui.sidebar import render_sidebar
+from ui.router import restore_from_url, sync_to_url
 
-if "page" not in st.session_state:
-    st.session_state.page = "home"
+# URL is the source of truth — restore page + run_id from query params
+# before doing anything else. This lets the app survive WebSocket reconnects.
+restore_from_url()
 
 # Render sidebar on every page
 render_sidebar()
@@ -217,3 +219,6 @@ elif page == "results":
     render_results()
 elif page == "briefs":
     render_briefs()
+
+# Push current session_state back into URL so the next reconnect can restore
+sync_to_url()

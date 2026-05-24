@@ -1,22 +1,36 @@
 """
-Top-level pipeline — v1.5 (Hybrid: Anthropic + Gemini + Serper)
+Top-level pipeline — v1.6 (Resumable: Anthropic + Gemini + Serper)
 
 Stage assignments:
   Anthropic Sonnet → Stages 2, 3, 5, 7  (quality-critical reasoning)
   Gemini Flash     → Stages 4, 6        (validation, supplementary — cost saving)
   Serper.dev       → Stage 3.5          (SERP + PAA + competitor data)
+
+Resumability:
+  Every stage writes a checkpoint to runs/<run_id>/_checkpoint_<stage>.json
+  on completion. If the pipeline is interrupted (network drop, page reload,
+  Streamlit Cloud session reset) and re-invoked with the same run_id, each
+  stage checks for its checkpoint and skips work that is already done.
+
+  Resume is automatic when a run_id is passed. To force a fresh run, use
+  a new run_id.
 """
 
 from __future__ import annotations
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
-from models import SeedInput, TopicalMap, EngineOutput
+from models import (
+    SeedInput, TopicalMap, EngineOutput,
+    CentralEntity, Pillar, LinkingPlan,
+)
 from stages.intake import load_intake_from_json
 from stages.central_entity import extract_central_entity
 from stages.expansion import expand_topics
-from stages.serp import pull_serp_for_pillars
+from stages.serp import pull_serp_for_pillars, SerpData, OrganicResult
 from stages.validation import validate_topics
 from stages.queries import generate_queries_for_all
 from stages.tiering import generate_supplementary_for_all
@@ -30,66 +44,158 @@ def _log(msg: str):
     print(f"[pipeline] {msg}", flush=True)
 
 
+# ── Serialization helpers for SerpData (dataclass, not pydantic) ──────────────
+
+def _serpdata_to_dict(s: SerpData) -> dict:
+    return {
+        "pillar_id":        s.pillar_id,
+        "query":            s.query,
+        "organic":          [asdict(o) for o in s.organic],
+        "paa":              list(s.paa),
+        "related_searches": list(s.related_searches),
+        "featured_snippet": s.featured_snippet,
+    }
+
+
+def _dict_to_serpdata(d: dict) -> SerpData:
+    sd = SerpData(pillar_id=d.get("pillar_id", ""), query=d.get("query", ""))
+    sd.organic = [
+        OrganicResult(
+            position=o.get("position", 0),
+            title=o.get("title", ""),
+            url=o.get("url", ""),
+            snippet=o.get("snippet", ""),
+        )
+        for o in d.get("organic", [])
+    ]
+    sd.paa              = list(d.get("paa", []))
+    sd.related_searches = list(d.get("related_searches", []))
+    sd.featured_snippet = d.get("featured_snippet", "")
+    return sd
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
 def run_pipeline(
     seed: SeedInput,
-    output_dir: str | Path,
+    output_dir: str | Path | None = None,
     skip_serp: bool = False,
     skip_validation: bool = False,
     serp_geo: str = "us",
     serp_lang: str = "en",
+    run_id: Optional[str] = None,
 ) -> EngineOutput:
     """
-    Run all stages end-to-end.
+    Run all stages end-to-end. Resumable when run_id is provided.
 
     skip_serp:       Skip Stage 3.5 (saves Serper calls during prompt iteration)
     skip_validation: Skip Stage 4 entirely
     serp_geo:        Serper country code — "us", "gb", "au" etc.
     serp_lang:       Language code — "en" etc.
+    run_id:          Unique run identifier. If supplied and prior checkpoints
+                     exist under runs/<run_id>/, those stages are skipped.
+                     If omitted, a fresh run_id is generated.
     """
-    output_dir = Path(output_dir)
+    # Lazy import so this module is usable from CLI without Streamlit installed
+    from ui import run_state
+
+    # ── Resolve run_id and working directory ─────────────────────────────────
+    if run_id is None:
+        run_id = run_state.new_run_id(seed.seed_keyword)
+        _log(f"New run_id: {run_id}")
+    else:
+        _log(f"Resuming run_id: {run_id}")
+
+    work_dir = run_state.run_dir(run_id)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # output_dir for final files defaults to the run directory itself
+    output_dir = Path(output_dir) if output_dir else work_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    tracker.reset()
 
-    # Stage 2: Central Entity (Anthropic)
-    _log("Stage 2: extracting central entity [Anthropic]...")
-    central = extract_central_entity(seed)
-    _log(f"  Primary: {central.primary}")
-    _checkpoint(output_dir, "stage2", {"central_entity": central.model_dump(mode="json")})
-
-    # Stage 3: Topic Expansion (Anthropic)
-    _log("Stage 3: expanding pillars and clusters [Anthropic]...")
-    pillars = expand_topics(seed, central)
-    _log(f"  {len(pillars)} pillars, {sum(len(p.clusters) for p in pillars)} clusters")
-    _checkpoint(output_dir, "stage3", {
-        "central_entity": central.model_dump(mode="json"),
-        "pillars": [p.model_dump(mode="json") for p in pillars],
+    # Persist seed + settings so a fully-fresh process can resume
+    run_state.save_seed(run_id, seed)
+    run_state.save_settings(run_id, {
+        "skip_serp":       skip_serp,
+        "skip_validation": skip_validation,
+        "serp_geo":        serp_geo,
+        "serp_lang":       serp_lang,
+        "output_dir":      str(output_dir),
     })
 
-    # Stage 3.5: SERP Intelligence (Serper.dev)
-    serp_data = None
-    if not skip_serp:
+    # Initialize progress tracking
+    if run_state.read_progress(run_id) is None:
+        run_state.init_progress(run_id)
+
+    # Cost tracker — reset only on fresh runs, preserve on resume
+    if not run_state.has_checkpoint(run_id, "stage2"):
+        tracker.reset()
+
+    # ── Stage 2: Central Entity (Anthropic) ──────────────────────────────────
+    if run_state.has_checkpoint(run_id, "stage2"):
+        cp = run_state.read_checkpoint(run_id, "stage2")
+        central = CentralEntity.model_validate(cp["central_entity"])
+        _log(f"Stage 2: SKIPPED (checkpoint found) — {central.primary}")
+    else:
+        _log("Stage 2: extracting central entity [Anthropic]...")
+        run_state.heartbeat(run_id, "Stage 2: extracting central entity...")
+        central = extract_central_entity(seed)
+        _log(f"  Primary: {central.primary}")
+        run_state.write_checkpoint(run_id, "stage2", {
+            "central_entity": central.model_dump(mode="json"),
+        })
+        run_state.mark_stage_complete(run_id, "stage2", f"Central entity: {central.primary}")
+
+    # ── Stage 3: Topic Expansion (Anthropic) ─────────────────────────────────
+    if run_state.has_checkpoint(run_id, "stage3"):
+        cp = run_state.read_checkpoint(run_id, "stage3")
+        pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
+        _log(f"Stage 3: SKIPPED (checkpoint found) — {len(pillars)} pillars")
+    else:
+        _log("Stage 3: expanding pillars and clusters [Anthropic]...")
+        run_state.heartbeat(run_id, "Stage 3: expanding pillars and clusters...")
+        pillars = expand_topics(seed, central)
+        _log(f"  {len(pillars)} pillars, {sum(len(p.clusters) for p in pillars)} clusters")
+        run_state.write_checkpoint(run_id, "stage3", {
+            "central_entity": central.model_dump(mode="json"),
+            "pillars":        [p.model_dump(mode="json") for p in pillars],
+        })
+        run_state.mark_stage_complete(run_id, "stage3", f"{len(pillars)} pillars expanded")
+
+    # ── Stage 3.5: SERP Intelligence (Serper.dev) ────────────────────────────
+    serp_data: Optional[dict[str, SerpData]] = None
+    if skip_serp:
+        _log("Stage 3.5: SKIPPED (skip_serp=True)")
+        run_state.mark_stage_complete(run_id, "stage3_5", "SERP skipped by setting")
+    elif run_state.has_checkpoint(run_id, "stage3_5"):
+        cp = run_state.read_checkpoint(run_id, "stage3_5")
+        serp_data = {pid: _dict_to_serpdata(d) for pid, d in cp.items()}
+        _log(f"Stage 3.5: SKIPPED (checkpoint found) — {len(serp_data)} pillars cached")
+    else:
         _log("Stage 3.5: pulling SERP data [Serper.dev]...")
+        run_state.heartbeat(run_id, "Stage 3.5: pulling SERP data...")
         serp_data = pull_serp_for_pillars(pillars, geo=serp_geo, lang=serp_lang)
         tracker.log_serper_call("Stage 3.5 — Serper.dev", len(pillars))
         total_paa     = sum(len(s.paa) for s in serp_data.values())
         total_related = sum(len(s.related_searches) for s in serp_data.values())
         _log(f"  PAA questions: {total_paa} | Related searches: {total_related}")
-        _checkpoint(output_dir, "stage3_5", {
-            pid: {
-                "organic": len(s.organic),
-                "paa": s.paa,
-                "related_searches": s.related_searches,
-                "featured_snippet": s.featured_snippet,
-            }
-            for pid, s in serp_data.items()
+        run_state.write_checkpoint(run_id, "stage3_5", {
+            pid: _serpdata_to_dict(s) for pid, s in serp_data.items()
         })
-    else:
-        _log("Stage 3.5: SKIPPED (skip_serp=True)")
+        run_state.mark_stage_complete(run_id, "stage3_5", f"{total_paa} PAA, {total_related} related")
 
-    # Stage 4: Validation (data-driven if serp_data, else Gemini Flash)
-    if not skip_validation:
+    # ── Stage 4: Validation ──────────────────────────────────────────────────
+    if skip_validation:
+        _log("Stage 4: SKIPPED (skip_validation=True)")
+        run_state.mark_stage_complete(run_id, "stage4", "Validation skipped by setting")
+    elif run_state.has_checkpoint(run_id, "stage4"):
+        cp = run_state.read_checkpoint(run_id, "stage4")
+        pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
+        _log("Stage 4: SKIPPED (checkpoint found)")
+    else:
         provider_label = "data-driven" if serp_data else "Gemini Flash"
         _log(f"Stage 4: validating topics [{provider_label}]...")
+        run_state.heartbeat(run_id, f"Stage 4: validating topics [{provider_label}]...")
         validations = validate_topics(pillars, serp_data)
         strong = sum(1 for v in validations.values() if v.signal == "strong")
         medium = sum(1 for v in validations.values() if v.signal == "medium")
@@ -105,34 +211,58 @@ def run_pipeline(
                     v = validations[cluster.id]
                     cluster.validation_signal    = v.signal
                     cluster.validation_reasoning = v.reasoning
+        run_state.write_checkpoint(run_id, "stage4", {
+            "pillars": [p.model_dump(mode="json") for p in pillars],
+        })
+        run_state.mark_stage_complete(run_id, "stage4", f"strong:{strong} medium:{medium} weak:{weak}")
+
+    # ── Stage 5: Query Generation (Anthropic + Serper PAA) ───────────────────
+    if run_state.has_checkpoint(run_id, "stage5"):
+        cp = run_state.read_checkpoint(run_id, "stage5")
+        pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
+        total_queries = sum(
+            len(p.representative_queries) + sum(len(c.represented_queries) for c in p.clusters)
+            for p in pillars
+        )
+        _log(f"Stage 5: SKIPPED (checkpoint found) — {total_queries} queries")
     else:
-        _log("Stage 4: SKIPPED")
+        _log("Stage 5: generating queries [Anthropic + Serper PAA]...")
+        run_state.heartbeat(run_id, "Stage 5: generating queries...")
+        pillars = generate_queries_for_all(pillars, serp_data)
+        total_queries = sum(
+            len(p.representative_queries) + sum(len(c.represented_queries) for c in p.clusters)
+            for p in pillars
+        )
+        _log(f"  {total_queries} queries total")
+        run_state.write_checkpoint(run_id, "stage5", {
+            "pillars": [p.model_dump(mode="json") for p in pillars],
+        })
+        run_state.mark_stage_complete(run_id, "stage5", f"{total_queries} queries generated")
 
-    # Stage 5: Query Generation (Anthropic + Serper PAA)
-    _log("Stage 5: generating queries [Anthropic + Serper PAA]...")
-    pillars = generate_queries_for_all(pillars, serp_data)
-    total_queries = sum(
-        len(p.representative_queries) + sum(len(c.represented_queries) for c in p.clusters)
-        for p in pillars
-    )
-    _log(f"  {total_queries} queries total")
-    _checkpoint(output_dir, "stage5", {
-        "pillars": [p.model_dump(mode="json") for p in pillars],
-    })
+    # ── Stage 6: Supplementary Nodes (Gemini Flash + Serper related) ─────────
+    if run_state.has_checkpoint(run_id, "stage6"):
+        cp = run_state.read_checkpoint(run_id, "stage6")
+        pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
+        total_supp = sum(
+            sum(len(c.supplementary_nodes) for c in p.clusters)
+            for p in pillars
+        )
+        _log(f"Stage 6: SKIPPED (checkpoint found) — {total_supp} supplementary nodes")
+    else:
+        _log("Stage 6: generating supplementary nodes [Gemini Flash + Serper related]...")
+        run_state.heartbeat(run_id, "Stage 6: generating supplementary nodes...")
+        pillars = generate_supplementary_for_all(pillars, serp_data)
+        total_supp = sum(
+            sum(len(c.supplementary_nodes) for c in p.clusters)
+            for p in pillars
+        )
+        _log(f"  {total_supp} supplementary nodes")
+        run_state.write_checkpoint(run_id, "stage6", {
+            "pillars": [p.model_dump(mode="json") for p in pillars],
+        })
+        run_state.mark_stage_complete(run_id, "stage6", f"{total_supp} supplementary nodes")
 
-    # Stage 6: Supplementary Nodes (Gemini Flash + Serper related searches)
-    _log("Stage 6: generating supplementary nodes [Gemini Flash + Serper related]...")
-    pillars = generate_supplementary_for_all(pillars, serp_data)
-    total_supp = sum(
-        sum(len(c.supplementary_nodes) for c in p.clusters)
-        for p in pillars
-    )
-    _log(f"  {total_supp} supplementary nodes")
-    _checkpoint(output_dir, "stage6", {
-        "pillars": [p.model_dump(mode="json") for p in pillars],
-    })
-
-    # Geo pages
+    # ── Geo pages (deterministic, fast — no checkpoint needed) ───────────────
     _log("Deriving geographic service pages...")
     geo_pages = derive_geo_pages(pillars, seed.intake.geo)
     _log(f"  {len(geo_pages)} geo pages")
@@ -143,10 +273,20 @@ def run_pipeline(
         geo_pages=geo_pages,
     )
 
-    # Stage 7: Internal Linking (Anthropic)
-    _log("Stage 7: building internal linking plan [Anthropic]...")
-    linking_plan = build_linking_plan(pillars)
-    _log(f"  {len(linking_plan.links)} links | {len(linking_plan.homepage_links)} homepage links")
+    # ── Stage 7: Internal Linking (Anthropic) ────────────────────────────────
+    if run_state.has_checkpoint(run_id, "stage7"):
+        cp = run_state.read_checkpoint(run_id, "stage7")
+        linking_plan = LinkingPlan.model_validate(cp["linking_plan"])
+        _log(f"Stage 7: SKIPPED (checkpoint found) — {len(linking_plan.links)} links")
+    else:
+        _log("Stage 7: building internal linking plan [Anthropic]...")
+        run_state.heartbeat(run_id, "Stage 7: building internal linking plan...")
+        linking_plan = build_linking_plan(pillars)
+        _log(f"  {len(linking_plan.links)} links | {len(linking_plan.homepage_links)} homepage links")
+        run_state.write_checkpoint(run_id, "stage7", {
+            "linking_plan": linking_plan.model_dump(mode="json"),
+        })
+        run_state.mark_stage_complete(run_id, "stage7", f"{len(linking_plan.links)} links")
 
     final_output = EngineOutput(
         input=seed,
@@ -154,37 +294,44 @@ def run_pipeline(
         linking_plan=linking_plan,
     )
 
-    # Stage 8: Render
-    _log("Stage 8: rendering JSON + Markdown report...")
-    paths = save_outputs(final_output, output_dir)
-    _log(f"  JSON:     {paths['json']}")
-    _log(f"  Markdown: {paths['markdown']}")
+    # ── Stage 8: Render ──────────────────────────────────────────────────────
+    if run_state.has_checkpoint(run_id, "stage8"):
+        _log("Stage 8: SKIPPED (checkpoint found) — outputs already rendered")
+    else:
+        _log("Stage 8: rendering JSON + Markdown report...")
+        run_state.heartbeat(run_id, "Stage 8: rendering outputs...")
+        paths = save_outputs(final_output, output_dir)
+        _log(f"  JSON:     {paths['json']}")
+        _log(f"  Markdown: {paths['markdown']}")
+        run_state.write_checkpoint(run_id, "stage8", {
+            "paths": {k: str(v) for k, v in paths.items()},
+        })
+        run_state.mark_stage_complete(run_id, "stage8", "Outputs rendered")
 
     _log("Pipeline complete.")
     tracker.print_report()
     tracker.save_report(output_dir / "cost_report.json")
 
-    # Auto-save session
+    # ── Auto-save session (Session History sidebar) ──────────────────────────
     try:
-        from ui.session_manager import save_session, _session_id
-        session_id = _session_id(seed.seed_keyword)
-        save_session(final_output, session_id)
-        _log(f"Session saved: {session_id}")
-        final_output._session_id = session_id
+        from ui.session_manager import save_session
+        save_session(final_output, run_id)
+        _log(f"Session saved: {run_id}")
+        final_output._session_id = run_id
     except Exception as e:
         _log(f"Session save skipped: {e}")
+
+    # Mark the run as fully completed in run_state
+    run_state.mark_run_completed(run_id, "Pipeline complete")
+    final_output._run_id = run_id
 
     return final_output
 
 
-def _checkpoint(output_dir: Path, name: str, data: dict):
-    path = output_dir / f"_checkpoint_{name}.json"
-    path.write_text(json.dumps(data, indent=2))
-
-
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python -m pipeline <input.json> <output_dir>")
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python -m pipeline <input.json> <output_dir> [run_id]")
         sys.exit(1)
     seed = load_intake_from_json(sys.argv[1])
-    run_pipeline(seed, sys.argv[2])
+    rid = sys.argv[3] if len(sys.argv) == 4 else None
+    run_pipeline(seed, sys.argv[2], run_id=rid)

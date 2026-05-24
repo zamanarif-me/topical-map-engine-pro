@@ -5,6 +5,7 @@ from models import (
     SeedInput, IntakeAnswers, GeoTargeting,
     BusinessFocus, SiteStage, GeoScope, ContentMix,
 )
+from ui.router import set_page, clear_run
 
 
 STEPS = [
@@ -43,7 +44,7 @@ def render_intake():
 
     # Back to home
     if st.button("← Back", key="back_home"):
-        st.session_state.page = "home"
+        set_page("home")
         st.rerun()
 
     st.markdown(f"### {STEPS[step]}")
@@ -312,5 +313,8 @@ def render_intake():
                     "skip_serp": data["skip_serp"],
                     "serp_geo": data["serp_geo"],
                 }
-                st.session_state.page = "pipeline"
+                # Fresh launch — no prior run id, force pipeline.py to mint one
+                clear_run()
+                st.session_state.pop("output", None)
+                set_page("pipeline")
                 st.rerun()

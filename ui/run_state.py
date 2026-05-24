@@ -1,0 +1,314 @@
+"""
+Run State Manager — persists in-progress pipeline runs to disk so they can
+survive WebSocket disconnects, browser reconnects, and Streamlit Cloud
+session resets.
+
+Layout:
+    runs/<run_id>/
+        seed.json          — full SeedInput, written before stage 2 starts
+        settings.json      — pipeline settings (skip_serp, serp_geo, ...)
+        progress.json      — {status, completed_stages[], started_at,
+                              last_updated_at, error, last_stage, message}
+        _checkpoint_<stage>.json   — written by pipeline after each stage
+        topical_map.json / .csv / .md   — final outputs (written by render)
+        cost_report.json   — final cost summary
+
+The 2-minute grace window means: after a network blip, if last_updated_at
+is within 120 seconds, we auto-resume. Past that, the user is asked.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from models import SeedInput
+
+
+RUNS_DIR = Path("runs")
+GRACE_WINDOW_SECONDS = 120          # 2 minutes — auto-resume window
+STALE_AFTER_SECONDS = 24 * 3600     # 24 hours — runs older than this are pruned
+
+# Canonical stage order — pipeline must follow this sequence
+STAGE_ORDER = [
+    "stage2",      # Central entity
+    "stage3",      # Pillars + clusters
+    "stage3_5",    # SERP intelligence (optional)
+    "stage4",      # Validation (optional)
+    "stage5",      # Queries
+    "stage6",      # Supplementary nodes
+    "stage7",      # Linking plan
+    "stage8",      # Render outputs
+]
+
+
+# ── ID + path helpers ────────────────────────────────────────────────────────
+
+def _slugify(seed: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", seed.lower().strip())
+    return slug[:40].strip("_") or "run"
+
+
+def new_run_id(seed_keyword: str) -> str:
+    """Generate a unique run id tied to a seed keyword."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{ts}_{_slugify(seed_keyword)}"
+
+
+def run_dir(run_id: str) -> Path:
+    return RUNS_DIR / run_id
+
+
+def run_exists(run_id: str) -> bool:
+    return run_dir(run_id).exists()
+
+
+# ── Seed + settings persistence ──────────────────────────────────────────────
+
+def save_seed(run_id: str, seed: SeedInput) -> None:
+    d = run_dir(run_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "seed.json").write_text(
+        json.dumps(seed.model_dump(mode="json"), indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_seed(run_id: str) -> Optional[SeedInput]:
+    path = run_dir(run_id) / "seed.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return SeedInput.model_validate(data)
+    except Exception:
+        return None
+
+
+def save_settings(run_id: str, settings: dict) -> None:
+    d = run_dir(run_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def load_settings(run_id: str) -> dict:
+    path = run_dir(run_id) / "settings.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+# ── Progress tracking ────────────────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def init_progress(run_id: str) -> dict:
+    """Create a fresh progress.json for a new run."""
+    progress = {
+        "run_id":            run_id,
+        "status":            "running",
+        "completed_stages":  [],
+        "last_stage":        None,
+        "message":           "Starting...",
+        "started_at":        _now_iso(),
+        "last_updated_at":   _now_iso(),
+        "error":             None,
+    }
+    _write_progress(run_id, progress)
+    return progress
+
+
+def read_progress(run_id: str) -> Optional[dict]:
+    path = run_dir(run_id) / "progress.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_progress(run_id: str, progress: dict) -> None:
+    d = run_dir(run_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "progress.json").write_text(json.dumps(progress, indent=2), encoding="utf-8")
+
+
+def mark_stage_complete(run_id: str, stage: str, message: str = "") -> None:
+    progress = read_progress(run_id) or init_progress(run_id)
+    if stage not in progress["completed_stages"]:
+        progress["completed_stages"].append(stage)
+    progress["last_stage"]      = stage
+    progress["message"]         = message or f"Completed {stage}"
+    progress["last_updated_at"] = _now_iso()
+    progress["status"]          = "running"
+    _write_progress(run_id, progress)
+
+
+def heartbeat(run_id: str, message: str = "") -> None:
+    """Touch last_updated_at without changing stage. Call from long stages."""
+    progress = read_progress(run_id)
+    if not progress:
+        return
+    progress["last_updated_at"] = _now_iso()
+    if message:
+        progress["message"] = message
+    _write_progress(run_id, progress)
+
+
+def mark_run_completed(run_id: str, message: str = "Pipeline complete") -> None:
+    progress = read_progress(run_id) or init_progress(run_id)
+    progress["status"]          = "completed"
+    progress["message"]         = message
+    progress["last_updated_at"] = _now_iso()
+    _write_progress(run_id, progress)
+
+
+def mark_run_failed(run_id: str, error: str) -> None:
+    progress = read_progress(run_id) or init_progress(run_id)
+    progress["status"]          = "failed"
+    progress["error"]           = error
+    progress["last_updated_at"] = _now_iso()
+    _write_progress(run_id, progress)
+
+
+# ── Resume detection ─────────────────────────────────────────────────────────
+
+def _seconds_since(iso_ts: str) -> float:
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except Exception:
+        return float("inf")
+
+
+def is_within_grace(run_id: str, grace_seconds: int = GRACE_WINDOW_SECONDS) -> bool:
+    """True if the run was updated within the grace window (default 2 min)."""
+    progress = read_progress(run_id)
+    if not progress:
+        return False
+    if progress.get("status") not in ("running",):
+        return False
+    return _seconds_since(progress.get("last_updated_at", "")) <= grace_seconds
+
+
+def run_status(run_id: str) -> str:
+    """Returns one of: 'missing', 'running_active', 'running_stale', 'completed', 'failed'."""
+    progress = read_progress(run_id)
+    if not progress:
+        return "missing"
+    status = progress.get("status", "running")
+    if status == "completed":
+        return "completed"
+    if status == "failed":
+        return "failed"
+    if is_within_grace(run_id):
+        return "running_active"
+    return "running_stale"
+
+
+def next_stage_to_run(run_id: str) -> Optional[str]:
+    """Return the next stage that has NOT been completed yet, or None if all done."""
+    progress = read_progress(run_id)
+    if not progress:
+        return STAGE_ORDER[0]
+    completed = set(progress.get("completed_stages", []))
+    for stage in STAGE_ORDER:
+        if stage not in completed:
+            return stage
+    return None
+
+
+# ── Checkpoint helpers ───────────────────────────────────────────────────────
+
+def checkpoint_path(run_id: str, stage: str) -> Path:
+    return run_dir(run_id) / f"_checkpoint_{stage}.json"
+
+
+def has_checkpoint(run_id: str, stage: str) -> bool:
+    return checkpoint_path(run_id, stage).exists()
+
+
+def read_checkpoint(run_id: str, stage: str) -> Optional[dict]:
+    path = checkpoint_path(run_id, stage)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def write_checkpoint(run_id: str, stage: str, data: dict) -> None:
+    d = run_dir(run_id)
+    d.mkdir(parents=True, exist_ok=True)
+    checkpoint_path(run_id, stage).write_text(
+        json.dumps(data, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+# ── Listing + cleanup ────────────────────────────────────────────────────────
+
+def list_active_runs() -> list[dict]:
+    """All runs currently in 'running' state (active or stale), newest first."""
+    if not RUNS_DIR.exists():
+        return []
+    runs = []
+    for d in RUNS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        progress = read_progress(d.name)
+        if not progress:
+            continue
+        if progress.get("status") == "running":
+            progress["age_seconds"] = _seconds_since(progress.get("last_updated_at", ""))
+            runs.append(progress)
+    runs.sort(key=lambda p: p.get("started_at", ""), reverse=True)
+    return runs
+
+
+def find_resumable_run_for_seed(seed_keyword: str) -> Optional[str]:
+    """Find the most recent running/stale run for this seed keyword."""
+    slug = _slugify(seed_keyword)
+    for progress in list_active_runs():
+        rid = progress.get("run_id", "")
+        if rid.endswith(slug):
+            return rid
+    return None
+
+
+def delete_run(run_id: str) -> bool:
+    d = run_dir(run_id)
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+        return True
+    return False
+
+
+def prune_stale_runs(max_age_seconds: int = STALE_AFTER_SECONDS) -> int:
+    """Delete runs older than max_age. Returns count removed."""
+    if not RUNS_DIR.exists():
+        return 0
+    removed = 0
+    for d in RUNS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        progress = read_progress(d.name)
+        if not progress:
+            continue
+        if _seconds_since(progress.get("last_updated_at", "")) > max_age_seconds:
+            if delete_run(d.name):
+                removed += 1
+    return removed
