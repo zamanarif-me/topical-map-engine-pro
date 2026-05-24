@@ -284,30 +284,52 @@ def render_intake():
                 st.session_state.intake_step -= 1
                 st.rerun()
         with col2:
-            if st.button("🚀  Generate Topical Map", type="primary"):
+            if st.button("🚀  Generate Topical Map", type="primary", key="intake_generate_btn"):
+                # Validate that every prior step actually saved its data.
+                # If the user reloaded mid-intake, the form re-renders but
+                # session_state.intake_data may be missing earlier answers.
+                required_keys = [
+                    "seed_keyword", "business_focus", "target_audience",
+                    "revenue_services", "geo_scope", "site_stage",
+                    "positioning", "focus_areas",
+                ]
+                missing = [k for k in required_keys if not data.get(k)]
+                if missing:
+                    st.error(
+                        f"Some earlier steps were not saved: {', '.join(missing)}. "
+                        f"Please go back through the steps with ← Prev and click Next on each."
+                    )
+                    st.stop()
+
                 data["content_mix"] = mix_opts[mix]
                 data["skip_serp"] = not run_serp
                 data["serp_geo"] = serp_geo
 
-                # Build SeedInput
-                seed_input = SeedInput(
-                    seed_keyword=data["seed_keyword"],
-                    intake=IntakeAnswers(
-                        business_focus=data["business_focus"],
-                        business_focus_detail=data.get("business_focus_detail"),
-                        target_audience=data["target_audience"],
-                        revenue_services=data["revenue_services"],
-                        geo=GeoTargeting(
-                            scope=data["geo_scope"],
-                            countries=data.get("countries", []),
-                            cities=data.get("cities", []),
+                try:
+                    seed_input = SeedInput(
+                        seed_keyword=data["seed_keyword"],
+                        intake=IntakeAnswers(
+                            business_focus=data["business_focus"],
+                            business_focus_detail=data.get("business_focus_detail"),
+                            target_audience=data["target_audience"],
+                            revenue_services=data["revenue_services"],
+                            geo=GeoTargeting(
+                                scope=data["geo_scope"],
+                                countries=data.get("countries", []),
+                                cities=data.get("cities", []),
+                            ),
+                            site_stage=data["site_stage"],
+                            positioning=data["positioning"],
+                            focus_areas=data["focus_areas"],
+                            content_mix=data["content_mix"],
                         ),
-                        site_stage=data["site_stage"],
-                        positioning=data["positioning"],
-                        focus_areas=data["focus_areas"],
-                        content_mix=data["content_mix"],
-                    ),
-                )
+                    )
+                except Exception as e:
+                    st.error(f"Could not build seed input: {e}")
+                    with st.expander("Debug — intake_data snapshot"):
+                        st.json(data)
+                    st.stop()
+
                 st.session_state.seed_input = seed_input
                 st.session_state.pipeline_settings = {
                     "skip_serp": data["skip_serp"],
