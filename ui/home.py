@@ -18,6 +18,7 @@ def render_home():
     Generate Koray-framework semantic topical maps,
     query networks, and content briefs — powered by
     Anthropic, Serper, and Gemini.
+    Created by "Zaman Arif"
 </div>
 """, unsafe_allow_html=True)
 
